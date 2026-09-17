@@ -7,11 +7,6 @@ from tqdm import tqdm
 class NLPOrderCausalDiscovery:
     """
     Scalable Causal Discovery (DAG Estimation) using SVO Semantic Priors.
-    
-    1. Extracts Subject-Verb-Object paths from dependency trees, bypassing relational verbs 
-       (e.g., 'rain' causes 'flooding' -> direct edge 'rain' -> 'flooding').
-    2. Ranks vocabulary via net outgoing flow to derive topological order pi.
-    3. Fits parallel ElasticNet regressions predicting each variable solely from its antecedents.
     """
     def __init__(
         self, 
@@ -28,39 +23,32 @@ class NLPOrderCausalDiscovery:
         self.pi = None
         self.W_ = None  # Adjacency matrix (W[i, j] represents edge i -> j)
         
-        # Relational connectives to bypass in causal flow calculations
         self.connective_verbs = set(connective_verbs or {
             "cause", "lead", "trigger", "result", "induce", 
             "produce", "bring", "create", "drive", "prompt"
         })
 
     def _extract_svo_triples(self, doc):
-        """Extracts direct (Subject -> Object) precedence edges from dependency trees."""
         edges = []
         for token in doc:
-            # Locate active/passive verbs or noun heads
             if token.pos_ in ["VERB", "AUX"]:
                 subjects = [c for c in token.children if "subj" in c.dep_]
                 objects = [c for c in token.children if "obj" in c.dep_ or "attr" in c.dep_]
                 
-                # Direct Subject -> Object path (bypasses connective verb)
                 for subj in subjects:
                     subj_lemma = subj.lemma_.lower()
                     
-                    # Connect to direct objects
                     for obj in objects:
                         obj_lemma = obj.lemma_.lower()
                         if subj_lemma != obj_lemma:
                             edges.append((subj_lemma, obj_lemma))
                             
-                    # Handle prepositional objects (e.g., "leads to flooding")
                     for prep in [c for c in token.children if c.dep_ == "prep"]:
                         for pobj in [c for c in prep.children if "obj" in c.dep_]:
                             pobj_lemma = pobj.lemma_.lower()
                             if subj_lemma != pobj_lemma:
                                 edges.append((subj_lemma, pobj_lemma))
                                 
-            # Direct Noun-to-Noun dependencies (e.g., "rain damage")
             elif token.dep_ in ["compound", "nmod"]:
                 head_lemma = token.head.lemma_.lower()
                 child_lemma = token.lemma_.lower()
@@ -75,7 +63,6 @@ class NLPOrderCausalDiscovery:
         word2idx = {word.lower(): i for i, word in enumerate(vocab)}
         precedence_matrix = np.zeros((d, d), dtype=np.float64)
 
-        # 1. PRE-FILTER: Keep only reviews containing AT LEAST TWO vocabulary words
         filtered_texts = []
         for text in tqdm(raw_texts, desc="Filtering relevant texts"):
             text_lower = text.lower()
@@ -83,9 +70,6 @@ class NLPOrderCausalDiscovery:
             if hits >= 2:
                 filtered_texts.append(text)
 
-        print(f"Pre-filtered {len(raw_texts)} reviews down to {len(filtered_texts)} relevant reviews for SpaCy parsing.")
-
-        # 2. Fast SpaCy processing with tqdm progress bar
         parsed_docs = self.nlp.pipe(filtered_texts, batch_size=1000)
         
         for doc in tqdm(parsed_docs, total=len(filtered_texts), desc="Parsing SpaCy SVO trees"):
@@ -95,7 +79,6 @@ class NLPOrderCausalDiscovery:
                     i, j = word2idx[src], word2idx[tgt]
                     precedence_matrix[i, j] += 1.0
 
-        # 3. Compute Net Flow Score
         net_asymmetry = precedence_matrix.sum(axis=1) - precedence_matrix.sum(axis=0)
         
         for verb in self.connective_verbs:
@@ -104,15 +87,37 @@ class NLPOrderCausalDiscovery:
                 
         return np.argsort(-net_asymmetry)
 
-    def _fit_single_variable(self, k, X_permuted):
+    def _is_self_directed(self, source_vocab, target_vocab):
+        """
+        Check if source and target share token overlapping definitions.
+        Example: 'dark' -> 'dark circles' or 'sensitive skin' -> 'skin'
+        """
+        src_tokens = set(source_vocab.lower().split())
+        tgt_tokens = set(target_vocab.lower().split())
+        return src_tokens.issubset(tgt_tokens) or tgt_tokens.issubset(src_tokens)
+
+    def _fit_single_variable(self, k, X_permuted, vocab):
         if k == 0:
             return np.zeros(0)
             
-        X_antecedents = X_permuted[:, :k]
+        target_vocab = vocab[self.pi[k]]
         y_target = X_permuted[:, k]
         
         if np.std(y_target) == 0:
             return np.zeros(k)
+
+        # Identify antecedent indices in topological order that are NOT self-directed
+        valid_antecedent_indices = []
+        for source_perm_idx in range(k):
+            source_vocab = vocab[self.pi[source_perm_idx]]
+            if not self._is_self_directed(source_vocab, target_vocab):
+                valid_antecedent_indices.append(source_perm_idx)
+
+        # If all antecedents overlap with target, return zero array of size k
+        if not valid_antecedent_indices:
+            return np.zeros(k)
+
+        X_antecedents = X_permuted[:, valid_antecedent_indices]
 
         model = ElasticNetCV(
             l1_ratio=[0.1, 0.5, 0.7, 0.9, 0.99],
@@ -122,10 +127,17 @@ class NLPOrderCausalDiscovery:
             max_iter=3000
         )
         model.fit(X_antecedents, y_target)
-        return model.coef_
+        
+        # Map fitted coefficients back to full k-length antecedent array
+        full_coefs = np.zeros(k)
+        for idx, orig_k_idx in enumerate(valid_antecedent_indices):
+            full_coefs[orig_k_idx] = model.coef_[idx]
+
+        return full_coefs
 
     def fit(self, raw_texts, X_dtm, vocab):
         d = len(vocab)
+        vocab = np.array(vocab)
         
         # 1. Topological Ordering via SVO Path Extraction
         self.pi = self._compute_topological_order(raw_texts, vocab)
@@ -133,14 +145,14 @@ class NLPOrderCausalDiscovery:
         # Permute columns according to topological order pi
         X_permuted = X_dtm[:, self.pi]
 
-        # 2. Parallel Edge Selection (Independent ElasticNet) with tqdm progress bar
+        # 2. Parallel Edge Selection (Independent ElasticNet with Masking)
         print("Fitting parallel ElasticNet regressions across vocabulary...")
         coef_list = Parallel(n_jobs=self.n_jobs)(
-            delayed(self._fit_single_variable)(k, X_permuted) 
+            delayed(self._fit_single_variable)(k, X_permuted, vocab) 
             for k in tqdm(range(d), desc="Fitting DAG regressions")
         )
 
-        # Construct strictly lower-triangular matrix (Acyclicity guaranteed)
+        # Construct strictly lower-triangular matrix
         W_permuted = np.zeros((d, d), dtype=np.float64)
         for k in range(1, d):
             W_permuted[k, :k] = coef_list[k]
